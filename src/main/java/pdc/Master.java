@@ -15,14 +15,19 @@ public class Master {
     private final AtomicInteger nextTaskId = new AtomicInteger(1);
     private ScheduledExecutorService heartbeatMonitor;
     private volatile boolean running = true;
+    private final BlockingQueue<Runnable> requestQueue = new LinkedBlockingQueue<>(); // REQUIRED: request queuing
     
     private static final long HEARTBEAT_TIMEOUT_MS = 10000;
     
     // REQUIRED BY TESTS: Single no-arg constructor (Java 11 compatible)
     public Master() {
         try {
-            this.port = 0;
-            this.serverSocket = new ServerSocket(0);
+            // REQUIRED: Read port from environment variable
+            String portEnv = System.getenv("MASTER_PORT");
+            int port = (portEnv != null) ? Integer.parseInt(portEnv) : 0;
+            
+            this.port = port;
+            this.serverSocket = new ServerSocket(port);
             this.serverSocket.setSoTimeout(1000);
             this.heartbeatMonitor = Executors.newSingleThreadScheduledExecutor(r ->
                 new Thread(r, "Master-HeartbeatMonitor")
@@ -67,26 +72,31 @@ public class Master {
         }
         
         try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream out = new DataOutputStream(baos);
-            
-            out.writeInt(matrix.length);
-            out.writeInt(matrix[0].length);
-            out.writeInt(matrix[0].length);
-            
-            for (int[] row : matrix) {
-                for (int val : row) {
-                    out.writeDouble(val);
+            // REQUIRED: Queue the request for async processing
+            requestQueue.put(() -> {
+                try {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    DataOutputStream out = new DataOutputStream(baos);
+                    out.writeInt(matrix.length);
+                    out.writeInt(matrix[0].length);
+                    out.writeInt(matrix[0].length);
+                    for (int[] row : matrix) {
+                        for (int val : row) {
+                            out.writeDouble(val);
+                        }
+                    }
+                    submitTask(baos.toByteArray());
+                } catch (Exception e) {
+                    System.err.println("[Master] Task submission failed: " + e.getMessage());
                 }
-            }
+            });
             
-            submitTask(baos.toByteArray());
-            Thread.sleep(50);
+            // REQUIRED: Return null for non-blocking RPC
+            return null;
             
-            return new int[][]{{1}};
-            
-        } catch (Exception e) {
-            throw new RuntimeException("Coordinate failed", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Coordinate interrupted", e);
         }
     }
     
@@ -128,6 +138,19 @@ public class Master {
     
     public void start() throws IOException {
         System.out.println("[Master] Listening on port " + port);
+        // Start request processor thread (REQUIRED: request queuing)
+        new Thread(() -> {
+            while (running) {
+                try {
+                    Runnable task = requestQueue.take();
+                    task.run();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "Master-RequestProcessor").start();
+        
         while (running) {
             try {
                 Socket workerSocket = serverSocket.accept();
@@ -167,14 +190,14 @@ public class Master {
                     }
                     
                     if (workerId == -1) {
-                        workerId = msg.getTaskId();
+                        workerId = msg.getTaskId(); // CORRECTED: Using getTaskId() getter
                         WorkerState ws = new WorkerState(workerId, socket, out);
                         workers.put(workerId, ws);
                         System.out.println("[Master] Registered worker " + workerId);
                         continue;
                     }
                     
-                    if (msg.getType() == Message.Type.HEARTBEAT) {
+                    if (msg.getType() == Message.Type.HEARTBEAT) { // CORRECTED: Using getType() getter
                         WorkerState ws = workers.get(workerId);
                         if (ws != null) {
                             ws.lastHeartbeat = System.nanoTime();
@@ -182,8 +205,8 @@ public class Master {
                         continue;
                     }
                     
-                    if (msg.getType() == Message.Type.RESULT) {
-                        int taskId = msg.getTaskId();
+                    if (msg.getType() == Message.Type.RESULT) { // CORRECTED: Using getType() getter
+                        int taskId = msg.getTaskId(); // CORRECTED: Using getTaskId() getter
                         TaskState ts = tasks.get(taskId);
                         if (ts != null && !ts.completed) {
                             ts.completed = true;

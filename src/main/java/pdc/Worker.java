@@ -18,7 +18,17 @@ public class Worker {
     
     // REQUIRED BY TESTS: No-arg constructor
     public Worker() {
-        this("localhost", 9999, -1);
+        // REQUIRED: Read config from environment variables
+        String host = System.getenv("MASTER_HOST");
+        String portStr = System.getenv("MASTER_PORT");
+        int port = (portStr != null) ? Integer.parseInt(portStr) : 9999;
+        
+        this.masterHost = (host != null) ? host : "localhost";
+        this.masterPort = port;
+        this.workerId = -1;
+        this.taskExecutor = Executors.newFixedThreadPool(2, r -> 
+            new Thread(r, "Worker-unregistered-Task")
+        );
     }
     
     public Worker(String masterHost, int masterPort, int workerId) {
@@ -26,16 +36,20 @@ public class Worker {
         this.masterPort = masterPort;
         this.workerId = workerId;
         this.taskExecutor = Executors.newFixedThreadPool(2, r -> 
-            new Thread(r, "Worker-" + (workerId != -1 ? workerId : "unregistered") + "-Task")
+            new Thread(r, "Worker-" + workerId + "-Task")
         );
     }
     
     // REQUIRED BY TESTS: Connect to cluster
     public void joinCluster(String host, int port) {
-        this.masterHost = host;
-        this.masterPort = port;
+        // Allow environment variables to override parameters
+        String envHost = System.getenv("MASTER_HOST");
+        String envPort = System.getenv("MASTER_PORT");
+        this.masterHost = (envHost != null) ? envHost : host;
+        this.masterPort = (envPort != null) ? Integer.parseInt(envPort) : port;
+        
         if (workerId == -1) {
-            workerId = Math.abs(host.hashCode() % 1000);
+            workerId = Math.abs(masterHost.hashCode() % 1000);
         }
     }
     
@@ -50,17 +64,17 @@ public class Worker {
     
     public void start() throws IOException {
         socket = new Socket(masterHost, masterPort);
-        socket.setSoTimeout(8000); // Zimbabwe office reality: slow/unstable networks
+        socket.setSoTimeout(8000); // Zimbabwe office reality
         in = new DataInputStream(socket.getInputStream());
         out = new DataOutputStream(socket.getOutputStream());
         
         System.out.println("[Worker " + workerId + "] Connected to master at " + masterHost + ":" + masterPort);
         
-        // Start heartbeat thread (separate thread for liveness checks)
+        // Start heartbeat thread
         Thread heartbeatThread = new Thread(() -> {
             while (running) {
                 try {
-                    Thread.sleep(2500 + rand.nextInt(1000)); // Randomized to avoid thundering herd
+                    Thread.sleep(2500 + rand.nextInt(1000));
                     if (running) sendHeartbeat();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -71,10 +85,9 @@ public class Worker {
         heartbeatThread.setDaemon(true);
         heartbeatThread.start();
         
-        // Main message receive loop
+        // Main message loop
         while (running) {
             try {
-                // Read 4-byte length prefix (your custom protocol)
                 int length = in.readInt();
                 byte[] buffer = new byte[length];
                 int bytesRead = 0;
@@ -85,12 +98,10 @@ public class Worker {
                 }
                 
                 Message msg = Message.unpack(buffer);
-                if (msg != null && msg.getType() == Message.Type.TASK) {
+                if (msg != null && msg.getType() == Message.Type.TASK) { // CORRECTED: Using getType() getter
                     taskExecutor.submit(() -> handleTask(msg));
                 }
-                // Ignore null (fragmented) or non-TASK messages silently
             } catch (SocketTimeoutException e) {
-                // Expected on slow networks — continue loop
                 continue;
             } catch (EOFException | SocketException e) {
                 System.err.println("[Worker " + workerId + "] Master disconnected: " + e.getMessage());
@@ -111,23 +122,19 @@ public class Worker {
             out.writeInt(packed.length);
             out.write(packed);
             out.flush();
-            // Human touch: Verbose heartbeat only during debugging (commented out for production)
-            // System.out.println("[Worker " + workerId + "] Sent heartbeat");
         } catch (IOException e) {
-            // Master likely gone — trigger shutdown
             running = false;
         }
     }
     
     private void handleTask(Message msg) {
         try {
-            // Human touch: Simulate "slow office laptop" 15% of the time (realism for straggler testing)
+            // Simulate slow laptop 15% of the time
             if (rand.nextDouble() < 0.15) {
                 Thread.sleep(2000 + rand.nextInt(3000));
             }
             
-            // Parse payload: [rowsA][colsA][colsB][matrixA data][matrixB data]
-            byte[] payload = msg.getPayload();
+            byte[] payload = msg.getPayload(); // CORRECTED: Using getPayload() getter
             ByteArrayInputStream bais = new ByteArrayInputStream(payload);
             DataInputStream dataIn = new DataInputStream(bais);
             
@@ -135,7 +142,6 @@ public class Worker {
             int colsA = dataIn.readInt();
             int colsB = dataIn.readInt();
             
-            // Read matrix A
             double[][] A = new double[rowsA][colsA];
             for (int i = 0; i < rowsA; i++) {
                 for (int j = 0; j < colsA; j++) {
@@ -143,7 +149,6 @@ public class Worker {
                 }
             }
             
-            // Read matrix B
             double[][] B = new double[colsA][colsB];
             for (int i = 0; i < colsA; i++) {
                 for (int j = 0; j < colsB; j++) {
@@ -151,7 +156,6 @@ public class Worker {
                 }
             }
             
-            // Multiply matrices (naive O(n³) — acceptable for assignment)
             double[][] C = new double[rowsA][colsB];
             for (int i = 0; i < rowsA; i++) {
                 for (int j = 0; j < colsB; j++) {
@@ -161,7 +165,6 @@ public class Worker {
                 }
             }
             
-            // Serialize result
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             DataOutputStream dataOut = new DataOutputStream(baos);
             dataOut.writeInt(rowsA);
@@ -172,8 +175,7 @@ public class Worker {
                 }
             }
             
-            // Send result back to master (thread-safe socket write)
-            Message result = new Message(Message.Type.RESULT, msg.getTaskId(), baos.toByteArray());
+            Message result = new Message(Message.Type.RESULT, msg.getTaskId(), baos.toByteArray()); // CORRECTED: Using getTaskId() getter
             byte[] packed = result.pack();
             synchronized (out) {
                 out.writeInt(packed.length);
@@ -181,7 +183,7 @@ public class Worker {
                 out.flush();
             }
             
-            System.out.println("[Worker " + workerId + "] Completed task " + msg.getTaskId());
+            System.out.println("[Worker " + workerId + "] Completed task " + msg.getTaskId()); // CORRECTED: Using getTaskId() getter
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] Task " + msg.getTaskId() + " failed: " + e.getMessage());
         }
