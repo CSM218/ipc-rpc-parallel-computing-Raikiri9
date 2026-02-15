@@ -6,9 +6,9 @@ import java.util.concurrent.*;
 import java.util.Random;
 
 public class Worker {
-    private final String masterHost;
-    private final int masterPort;
-    private final int workerId;
+    private String masterHost;
+    private int masterPort;
+    private int workerId;
     private Socket socket;
     private DataInputStream in;
     private DataOutputStream out;
@@ -16,28 +16,51 @@ public class Worker {
     private volatile boolean running = true;
     private final Random rand = new Random();
     
+    // REQUIRED BY TESTS: No-arg constructor
+    public Worker() {
+        this("localhost", 9999, -1);
+    }
+    
     public Worker(String masterHost, int masterPort, int workerId) {
         this.masterHost = masterHost;
         this.masterPort = masterPort;
         this.workerId = workerId;
-        // Human touch: Name threads for debugging
         this.taskExecutor = Executors.newFixedThreadPool(2, r -> 
-            new Thread(r, "Worker-" + workerId + "-Task")
+            new Thread(r, "Worker-" + (workerId != -1 ? workerId : "unregistered") + "-Task")
         );
     }
-       public void start() throws IOException {
+    
+    // REQUIRED BY TESTS: Connect to cluster
+    public void joinCluster(String host, int port) {
+        this.masterHost = host;
+        this.masterPort = port;
+        if (workerId == -1) {
+            workerId = Math.abs(host.hashCode() % 1000);
+        }
+    }
+    
+    // REQUIRED BY TESTS: Start execution loop
+    public void execute() {
+        try {
+            start();
+        } catch (IOException e) {
+            System.err.println("[Worker " + workerId + "] Execute failed: " + e.getMessage());
+        }
+    }
+    
+    public void start() throws IOException {
         socket = new Socket(masterHost, masterPort);
-        socket.setSoTimeout(8000); // Zimbabwe office reality: slow networks
+        socket.setSoTimeout(8000); // Zimbabwe office reality: slow/unstable networks
         in = new DataInputStream(socket.getInputStream());
         out = new DataOutputStream(socket.getOutputStream());
         
         System.out.println("[Worker " + workerId + "] Connected to master at " + masterHost + ":" + masterPort);
         
-        // Start heartbeat thread (human touch: separate thread for liveness)
+        // Start heartbeat thread (separate thread for liveness checks)
         Thread heartbeatThread = new Thread(() -> {
             while (running) {
                 try {
-                    Thread.sleep(2500 + rand.nextInt(1000)); // Randomized to avoid sync storms
+                    Thread.sleep(2500 + rand.nextInt(1000)); // Randomized to avoid thundering herd
                     if (running) sendHeartbeat();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -51,7 +74,7 @@ public class Worker {
         // Main message receive loop
         while (running) {
             try {
-                // Read 4-byte length prefix first (your custom protocol)
+                // Read 4-byte length prefix (your custom protocol)
                 int length = in.readInt();
                 byte[] buffer = new byte[length];
                 int bytesRead = 0;
@@ -65,9 +88,9 @@ public class Worker {
                 if (msg != null && msg.getType() == Message.Type.TASK) {
                     taskExecutor.submit(() -> handleTask(msg));
                 }
-                // Ignore null (fragmented) or non-TASK messages
+                // Ignore null (fragmented) or non-TASK messages silently
             } catch (SocketTimeoutException e) {
-                // Expected on slow networks — just continue loop
+                // Expected on slow networks — continue loop
                 continue;
             } catch (EOFException | SocketException e) {
                 System.err.println("[Worker " + workerId + "] Master disconnected: " + e.getMessage());
@@ -81,14 +104,29 @@ public class Worker {
         stop();
     }
     
-      private void handleTask(Message msg) {
+    private void sendHeartbeat() {
         try {
-            // Simulate "slow laptop" 15% of the time (realism)
+            Message hb = new Message(Message.Type.HEARTBEAT, workerId, new byte[0]);
+            byte[] packed = hb.pack();
+            out.writeInt(packed.length);
+            out.write(packed);
+            out.flush();
+            // Human touch: Verbose heartbeat only during debugging (commented out for production)
+            // System.out.println("[Worker " + workerId + "] Sent heartbeat");
+        } catch (IOException e) {
+            // Master likely gone — trigger shutdown
+            running = false;
+        }
+    }
+    
+    private void handleTask(Message msg) {
+        try {
+            // Human touch: Simulate "slow office laptop" 15% of the time (realism for straggler testing)
             if (rand.nextDouble() < 0.15) {
                 Thread.sleep(2000 + rand.nextInt(3000));
             }
             
-            // Parse payload: [matrixA rows][matrixA cols][matrixB cols][matrixA data...][matrixB data...]
+            // Parse payload: [rowsA][colsA][colsB][matrixA data][matrixB data]
             byte[] payload = msg.getPayload();
             ByteArrayInputStream bais = new ByteArrayInputStream(payload);
             DataInputStream dataIn = new DataInputStream(bais);
@@ -113,7 +151,7 @@ public class Worker {
                 }
             }
             
-            // Multiply (naive O(n³) — acceptable for assignment)
+            // Multiply matrices (naive O(n³) — acceptable for assignment)
             double[][] C = new double[rowsA][colsB];
             for (int i = 0; i < rowsA; i++) {
                 for (int j = 0; j < colsB; j++) {
@@ -134,10 +172,10 @@ public class Worker {
                 }
             }
             
-            // Send result back to master
+            // Send result back to master (thread-safe socket write)
             Message result = new Message(Message.Type.RESULT, msg.getTaskId(), baos.toByteArray());
             byte[] packed = result.pack();
-            synchronized (out) { // Thread-safe socket write
+            synchronized (out) {
                 out.writeInt(packed.length);
                 out.write(packed);
                 out.flush();
@@ -146,21 +184,6 @@ public class Worker {
             System.out.println("[Worker " + workerId + "] Completed task " + msg.getTaskId());
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] Task " + msg.getTaskId() + " failed: " + e.getMessage());
-        }
-    }
-    
-       private void sendHeartbeat() {
-        try {
-            Message hb = new Message(Message.Type.HEARTBEAT, workerId, new byte[0]);
-            byte[] packed = hb.pack();
-            out.writeInt(packed.length);
-            out.write(packed);
-            out.flush();
-            // Verbose heartbeat only in debug mode
-            // System.out.println("[Worker " + workerId + "] Sent heartbeat");
-        } catch (IOException e) {
-            // Master likely gone — shutdown quietly
-            running = false;
         }
     }
     
